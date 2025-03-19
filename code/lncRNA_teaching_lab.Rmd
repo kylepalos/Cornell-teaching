@@ -160,10 +160,10 @@ In this section, we'll import the count data and metadata for our experiment, en
 counts_link <- "https://raw.githubusercontent.com/kylepalos/Cornell-teaching/refs/heads/main/data/light_counts.txt"
 
 download.file(counts_link,
-              "~/Downloads/light_counts.txt")
+              "~/light_counts.txt")
 
 
-counts <- read.delim("~/Downloads/light_counts.txt", check.names = FALSE, stringsAsFactors = FALSE)
+counts <- read.delim("~/light_counts.txt", check.names = FALSE, stringsAsFactors = FALSE)
 
 # Check for any formatting issues
 dim(counts)
@@ -173,9 +173,9 @@ head(counts)
 metadata_link <- "https://raw.githubusercontent.com/kylepalos/Cornell-teaching/refs/heads/main/data/high_light_simple_metadata.txt"
 
 download.file(metadata_link,
-              "~/Downloads/high_light_simple_metadata.txt")
+              "~/high_light_simple_metadata.txt")
 
-metadata <- read.delim("~/Downloads/high_light_simple_metadata.txt", stringsAsFactors = FALSE)
+metadata <- read.delim("~/high_light_simple_metadata.txt", stringsAsFactors = FALSE)
 head(metadata)
 
 # Ensure metadata and count data match
@@ -401,7 +401,7 @@ pheatmap(cor_matrix,
 >
 > 2.  Do samples cluster primarily by condition or by time point? What does this tell you about the strength/effect of the experimental variables?
 >
-> 3.  Can you identify any potential outlier samples or batch effects that might affect downstream analysis?
+> 3.  Can you identify any potential outliar samples or batch effects that might affect downstream analysis?
 
 ## Examining the variance within the data
 
@@ -1318,9 +1318,9 @@ This section explores the potential regulatory networks involving transcription 
 tf_link <- "https://raw.githubusercontent.com/kylepalos/Cornell-teaching/refs/heads/main/data/Ath_TF_list.txt"
 
 download.file(tf_link,
-              "~/Downloads/Ath_TF_list.txt")
+              "~/Ath_TF_list.txt")
 
-tf_list <- read.delim("~/Downloads/Ath_TF_list.txt", stringsAsFactors = FALSE)
+tf_list <- read.delim("~/Ath_TF_list.txt", stringsAsFactors = FALSE)
 head(tf_list)
 
 # Create a mapping between gene IDs and TF families
