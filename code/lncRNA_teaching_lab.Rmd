@@ -1,0 +1,2018 @@
+---
+title: "Differential expression analysis in Arabidopsis with a focus on lncRNA biology"
+author: "Kyle Palos"
+date: "Mar 19, 2025"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+    code_folding: hide
+---
+
+# Setup
+
+This first chunk is setting the default options:
+
+echo = T: In the final document, the code will be visible.
+
+warning = F: Suppresses warning messages when running code.
+
+message = F: This suppresses messages from packages are loaded or functions ran.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 7)
+```
+
+# Introduction
+
+This document outlines the analysis of RNA-seq data to identify differentially expressed genes, with a specific focus on long non-coding RNAs (lncRNAs). Specifically, we will be examining [PRJNA435737](https://www.ncbi.nlm.nih.gov/bioproject/PRJNA435737) which is an RNA-seq experiment coming out of Joanne Chory's lab from 2019. The experiment profiles 7 day old seedlings grown under regular or high intensity light for .5, 6, 12, 24, 48, or 72 hours. Additionally, there is a recovery treatment 14 hours after the 72 hour time point. There are 2 biological replicates for all treatment/time-point combinations.
+
+This is from Figure 1 of the associated manuscripts.
+
+<https://www.ncbi.nlm.nih.gov/core/lw/2.0/html/tileshop_pmc/tileshop_pmc_inline.html?title=Click%20on%20image%20to%20zoom&p=PMC3&id=7030938_nihms-1547112-f0002.jpg>
+
+This document will load in count data from the RNA-seq experiment, perform QC checks, run differential expression, then perform some down-stream analyses to try to determine how lncRNAs fit into the transcriptional landscape of high light response.
+
+> **Discussion Point:** How would you imagine this experimental approach being analyzed? Grow light vs high light? Time-point vs time-point within each treatment independently? Additionally, what types of molecular functions might lncRNAs have in plant responses to high light? What kinds of genes do you expect to be turned on in response to high light?
+
+## Research Questions
+
+1.  How do gene expression profiles change in response to high light over time?
+2.  How do lncRNAs specifically respond to these treatments compared to protein-coding genes?
+3.  Can we identify lncRNAs that may play regulatory roles in high light response?
+
+# Package installation check
+
+> **Note to Students:** This code block checks for and installs necessary packages for the analysis. Notice how the packages are organized into analysis types (code analysis, data manipulation, etc.)
+
+```{r Package-installation-check}
+# Function to check and install required packages
+check_and_install_packages <- function(packages) {
+  new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+  if(length(new_packages)) {
+    message("Installing the following packages: ", paste(new_packages, collapse = ", "))
+    
+    # Check for Bioconductor packages
+    bioc_packages <- c("DESeq2", "edgeR", "limma", "PCAtools", "ComplexHeatmap", 
+                      "clusterProfiler", "org.At.tair.db", "GOSemSim", "EnhancedVolcano")
+    
+    # Split into CRAN and Bioconductor packages
+    cran_to_install <- new_packages[!(new_packages %in% bioc_packages)]
+    bioc_to_install <- new_packages[new_packages %in% bioc_packages]
+    
+    # Install CRAN packages
+    if(length(cran_to_install) > 0) {
+      install.packages(cran_to_install, repos = "https://cloud.r-project.org")
+    }
+    
+    # Install Bioconductor packages
+    if(length(bioc_to_install) > 0) {
+      if (!requireNamespace("BiocManager", quietly = TRUE)) {
+        install.packages("BiocManager", repos = "https://cloud.r-project.org")
+      }
+      BiocManager::install(bioc_to_install)
+    }
+  } else {
+    message("All required packages are already installed.")
+  }
+}
+
+# List of required packages
+required_packages <- c(
+  # Core analysis packages
+  "DESeq2", "edgeR", "limma",
+  
+  # Data manipulation
+  "dplyr", "tidyr", "tibble", "stringr", "reshape2",
+  
+  # Visualization
+  "ggplot2", "pheatmap", "EnhancedVolcano", "RColorBrewer", 
+  "PCAtools", "ComplexHeatmap", "UpSetR",
+  
+  # Functional analysis
+  "clusterProfiler", "org.At.tair.db", "GOSemSim", "enrichplot",
+  
+  # Network analysis packages
+  "igraph", "ggraph", "tidygraph"
+)
+
+# Check and install packages
+check_and_install_packages(required_packages)
+
+# Load the packages (wrapped in suppressMessages to keep the output clean)
+suppressMessages({
+  for(pkg in required_packages) {
+    library(pkg, character.only = TRUE)
+  }
+})
+```
+
+# Loading Required Libraries
+
+```{r load-libraries}
+# Core analysis packages
+library(DESeq2)
+library(edgeR)
+library(limma)
+
+# Data manipulation
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+
+# Visualization
+library(ggplot2)
+library(pheatmap)
+library(EnhancedVolcano)
+library(RColorBrewer)
+library(PCAtools)
+library(ComplexHeatmap)
+library(UpSetR)
+library(enrichplot)
+
+# Functional analysis
+library(clusterProfiler)
+library(org.At.tair.db) # Arabidopsis annotations
+library(GOSemSim)
+
+# Set default theme for ggplot2
+theme_set(theme_bw() + 
+          theme(text = element_text(size = 12),
+                axis.text = element_text(size = 10),
+                legend.position = "right"))
+```
+
+# Data Import and Pre-processing
+
+Start by downloading the necessary input count and metadata tables. Download to "\~/Downloads/" directory and load from there.
+
+In this section, we'll import the count data and metadata for our experiment, ensuring that sample identifiers match correctly between files.
+
+## Loading Count Data and Metadata
+
+```{r import-data}
+
+# Import count data
+counts_link <- "https://raw.githubusercontent.com/kylepalos/Cornell-teaching/refs/heads/main/data/light_counts.txt"
+
+download.file(counts_link,
+              "~/Downloads/light_counts.txt")
+
+
+counts <- read.delim("~/Downloads/light_counts.txt", check.names = FALSE, stringsAsFactors = FALSE)
+
+# Check for any formatting issues
+dim(counts)
+head(counts)
+
+# Import metadata
+metadata_link <- "https://raw.githubusercontent.com/kylepalos/Cornell-teaching/refs/heads/main/data/high_light_simple_metadata.txt"
+
+download.file(metadata_link,
+              "~/Downloads/high_light_simple_metadata.txt")
+
+metadata <- read.delim("~/Downloads/high_light_simple_metadata.txt", stringsAsFactors = FALSE)
+head(metadata)
+
+# Ensure metadata and count data match
+all(colnames(counts)[-1] %in% metadata$Run)
+
+# Create a properly ordered metadata to match the count matrix
+metadata <- metadata[match(colnames(counts)[-1], metadata$Run),]
+rownames(metadata) <- metadata$Run
+
+# Check ordering
+all(colnames(counts)[-1] == rownames(metadata))
+```
+
+**This code chunk loaded in the RNA-seq counts and associated metadata.**
+
+> **Group discussion:** Take a moment to look at the counts data and metadata tables. What do you notice? How does the counts table get linked to the metadata table? What would happen if a sample was mislabeled?
+
+## Separating lncRNAs and Protein-Coding Genes
+
+Next, we'll identify different gene types in our dataset, particularly distinguishing between lncRNAs and protein-coding genes based on their identifiers. This is a bit of a coarse approach - in reality what we're calling protein coding genes are really just all Arabidopsis annotated genes (most make mRNAs - but there are some other regulatory RNAs in there as well). This is just for demonstration purposes.
+
+```{r separate-gene-types}
+# Create a function to identify gene types based on ID patterns
+identify_gene_type <- function(gene_id) {
+  if(grepl("MSTRG", gene_id)) {
+    return("lncRNA")
+  } else if(grepl("gene:AT", gene_id)) {
+    return("protein_coding")
+  } else {
+    return("other")
+  }
+}
+
+# Add gene type information
+counts$gene_type <- sapply(counts$gene, identify_gene_type)
+table(counts$gene_type)
+
+# Create separate dataframes for visualization purposes
+lncrna_counts <- counts[counts$gene_type == "lncRNA", ]
+pc_counts <- counts[counts$gene_type == "protein_coding", ]
+
+# Create a mapping data frame for gene information
+gene_info <- data.frame(
+  gene_id = counts$gene,
+  gene_type = counts$gene_type,
+  stringsAsFactors = FALSE
+)
+```
+
+## Preparing Data for DESeq2
+
+Now we'll prepare our data for differential expression analysis using DESeq2, including filtering lowly expressed genes and setting up the experimental design.
+
+```{r prepare-deseq}
+# Set up the count matrix for DESeq2
+count_matrix <- as.matrix(counts[, 2:(ncol(counts)-1)])
+rownames(count_matrix) <- counts$gene
+
+# Filter low expressed genes (at least 10 counts in at least 2 samples)
+keep <- rowSums(count_matrix >= 10) >= 2
+count_matrix_filtered <- count_matrix[keep, ]
+gene_info_filtered <- gene_info[keep, ]
+
+# See how many genes we retained
+dim(count_matrix)
+dim(count_matrix_filtered)
+
+# Create DESeq2 dataset object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_matrix_filtered,
+  colData = metadata,
+  design = ~Combined
+)
+
+# Factor levels - set Control and earliest time point as references
+dds$Treatment <- relevel(factor(dds$Treatment), ref = "growth_light")
+dds$Time <- factor(dds$Time, levels = c("0.5", "6", "12", "14","24", "48", "72"))
+```
+
+**This code chunk prepares the count data and R object that will ultimately be used for differential expression.**
+
+**The output gives the dimension of the counts table pre- and post- filtering.**
+
+**Group discussion:**
+
+> 1.  We filtered genes with fewer than 10 counts in at least 2 samples. What are some reasons we may be doing this? How might the threshold chosen affect our results?
+>
+> 2.  Examine the design formula: `~Combined`. What does this formula tell DESeq2 about our experimental design? If you were explain design formula to a non-scientist, how would you go about this?
+>
+> 3.  How many genes were removed by our filtering step? What types of genes might be most affected by this filtering?
+
+# Quality Control and Exploratory Data Analysis
+
+Before proceeding with differential expression analysis, it's essential to assess the quality of our data and explore overall patterns through exploratory analysis.
+
+## Library Size and Count Distribution
+
+```{r library-size}
+# Calculate library sizes
+lib_sizes <- colSums(count_matrix)
+median_lib_size <- median(lib_sizes)
+
+# Plot library sizes
+library_df <- data.frame(
+  Sample = names(lib_sizes),
+  LibrarySize = lib_sizes,
+  Condition = metadata$Treatment,
+  Time = metadata$Time
+) %>%
+  mutate(
+    Combined = paste(Condition, Time, sep = "_"),
+    NormFactor = LibrarySize/median_lib_size
+  )
+
+# Plot library sizes
+ggplot(library_df, aes(x = Sample, y = LibrarySize/1e6, fill = Condition)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_grid(~Time, scales = "free_x", space = "free") +
+  labs(y = "Library Size (millions)", title = "Sequencing Depth per Sample") +
+  scale_fill_brewer(palette = "Set1")
+
+# Plot count distributions
+log_counts <- log2(count_matrix + 1)
+melted_counts <- reshape2::melt(log_counts)
+colnames(melted_counts) <- c("Gene", "Sample", "Log2Count")
+
+ggplot(melted_counts, aes(x = Log2Count, color = Sample)) +
+  geom_density() +
+  theme(legend.position = "none") +
+  labs(title = "Distribution of log2-transformed counts",
+       x = "Log2(count + 1)") +
+  facet_wrap(~ Sample, ncol = 6)
+```
+
+**This code chunk examines 2 different things:**
+
+1.  The "library" size of each RNA-seq experiment
+2.  The distribution in read counts for all genes in each experiment.
+
+> **Group discussion:**
+>
+> Examine the library size plot and count distributions:
+>
+> 1.  Explain these plots to each other. What do the axes mean? Why are we making sub-plots?
+>
+> 2.  Are there substantial differences in library sizes between samples? If so, is this concerning? How might the differential expression programs account for this?
+>
+> 3.  What patterns do you observe in the count distributions? From a biological perspective, why do they mostly look similar?
+>
+>     1.  How would you explain log2 counts to a non-scientist? Why was this transformation performed?
+>
+>     2.  Why was a +1 added to the counts?
+
+## PCA Analysis
+
+Principal Component Analysis (PCA) is a powerful technique for visualizing sample relationships and identifying major sources of variation in the data.
+
+```{r pca-analysis}
+# Variance stabilizing transformation for visualization
+vsd <- vst(dds, blind = FALSE)
+
+# More detailed PCA with pcatools
+pca_data <- plotPCA(vsd, intgroup = c("Treatment", "Time"), returnData = TRUE)
+percentVar <- round(100 * attr(pca_data, "percentVar"))
+
+# Custom PCA plot
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Time, shape = Treatment)) +
+  geom_point(size = 3) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  ggtitle("Principal Component Analysis") +
+  scale_color_brewer(palette = "Set1") +
+  theme(aspect.ratio = 1) +
+  stat_ellipse(aes(group = Treatment), type = "t", level = 0.95)
+
+```
+
+**This code chunk performs a principal component analysis.**
+
+> **Group discussion:**
+>
+> Examine the PCA plot and discuss the following with your group:
+>
+> 1.  How do you interpret PCA plots? What are the axes and the points on the plots?
+>     1.  What does it mean to be close or far on the plot?
+> 2.  What is the primary source of variation in the data (PC1)? Does it correspond to treatment, or time point?
+> 3.  Do you observe any time-dependent patterns in the sample clustering? Do samples from different time points group together or separate?
+> 4.  How would you explain this plot to a non-scientist?
+> 5.  If your PI saw these data, would they conclude that your experiment worked or not?
+
+## Sample Clustering
+
+Hierarchical clustering provides another perspective on sample relationships, complementing the PCA analysis.
+
+```{r sample-clustering}
+
+# Correlation heatmap
+cor_matrix <- cor(assay(vsd), method = "spearman")
+pheatmap(cor_matrix,
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+         border_color = NA,
+         main = "Sample Correlation Heatmap",
+         annotation_col = data.frame(
+           Condition = vsd$Treatment,
+           Time = vsd$Time,
+           row.names = rownames(cor_matrix)
+         ),
+         annotation_colors = list(
+           Condition = c(growth_light = "lightblue", Recovery = "yellowgreen", high_light = "darkred"),
+           Time = c("0.5" = "lightgreen", "6" = "green3", "12" = "darkgreen",
+                    "14" = "darkolivegreen", "24" = "darkkhaki", "48" = "darkolivegreen1", "72" = "darkolivegreen4")))
+         
+```
+
+**This code chunk produces a heatmap of RNA-seq sample relatedness.**
+
+> **Group discussion:**
+>
+> Examine the sample clustering heatmap and discuss:
+>
+> 1.  Open the code block and determine what is being plotted. What does the color in the cells correspond to?
+>
+> 2.  Do samples cluster primarily by condition or by time point? What does this tell you about the strength/effect of the experimental variables?
+>
+> 3.  Can you identify any potential outlier samples or batch effects that might affect downstream analysis?
+
+## Examining the variance within the data
+
+Let's examine the relationship between mean counts and variance to identify potential batch effects or technical biases.
+
+```{r mean-variance-analysis}
+
+# examine mean variance relationship from count data vs VST data:
+cts_variance <- apply(count_matrix_filtered, 1, var)
+vsd_matrix <- assay(vsd)
+mean_counts <- rowMeans(count_matrix_filtered)
+variance <- apply(vsd_matrix, 1, var)
+
+mean_count_var_df <- data.frame(
+  mean = mean_counts,
+  variance = cts_variance,
+  gene_type = gene_info_filtered$gene_type
+)
+
+cts_variance_plot <- ggplot(mean_count_var_df, aes(x = log2(mean + 1), y = log2(variance + 1), color = gene_type)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_smooth(method = "loess", se = TRUE) +
+  theme_bw() +
+  labs(title = "Mean-Variance Relationship of counts",
+       x = "Log2 + 1 Mean Count",
+       y = "Log2 + 1 variance of counts") +
+  scale_color_manual(values = c("lncRNA" = "red", "protein_coding" = "blue", "other" = "gray")) 
+
+
+# # Calculate potential variables that might explain variation
+# vsd_matrix <- assay(vsd)
+# mean_counts <- rowMeans(count_matrix_filtered)
+# variance <- apply(vsd_matrix, 1, var)
+
+# Plot mean-variance relationship
+mean_var_df <- data.frame(
+  mean = mean_counts,
+  variance = variance,
+  gene_type = gene_info_filtered$gene_type
+)
+
+vst_variance_plot <- ggplot(mean_var_df, aes(x = log2(mean + 1), y = log2(variance + 1), color = gene_type)) +
+  geom_point(alpha = 0.5, size = 1) +
+  geom_smooth(method = "loess", se = TRUE) +
+  theme_bw() +
+  labs(title = "Mean-Variance Relationship of VST counts",
+       x = "Log2 + 1 Mean Count",
+       y = "Log2 + 1 variance of VST counts") +
+  scale_color_manual(values = c("lncRNA" = "red", "protein_coding" = "blue", "other" = "gray"))
+
+
+cts_variance_plot + vst_variance_plot
+```
+
+**This code chunk computes two metrics:**
+
+1.  **The average number of counts for each gene**
+2.  **The average variance of counts for each gene**
+
+> **Group discussion:**
+>
+> Analyze the mean-variance relationship plots:
+>
+> 1.  What's the difference between these 2 plots? Are the axes the same?
+> 2.  What is the expected relationship between mean expression (counts) and variance of counts in RNA-seq data? Does our data follow this expectation?
+> 3.  **What is the VST process doing to the counts? Why do you think variance stabilization is important before downstream analyses?**
+> 4.  Do lncRNAs and protein coding genes show large differences in the mean/variance relationship?
+
+# Differential Expression Analysis
+
+Now that we've assessed data quality and explored overall patterns, we'll proceed with differential expression analysis to identify genes that respond to ABA and salt treatments across time points.
+
+## Running DESeq2
+
+```{r run-deseq}
+# Set reference level to growth_light at earliest time point (0.5h)
+dds$Combined <- relevel(factor(dds$Combined), ref = "growth_light_05")
+
+# Run DESeq2
+dds <- DESeq(dds)
+resultsNames(dds)
+
+# Define the comparisons we want to make
+# For each time point, compare high_light vs growth_light, and recovery vs growth_light where applicable
+contrasts_list <- list(
+  HL_vs_GL_05h = c("Combined", "high_light_05", "growth_light_05"),
+  HL_vs_GL_6h = c("Combined", "high_light_6", "growth_light_6"),
+  HL_vs_GL_12h = c("Combined", "high_light_12", "growth_light_12"),
+  HL_vs_GL_24h = c("Combined", "high_light_24", "growth_light_24"),
+  HL_vs_GL_48h = c("Combined", "high_light_48", "growth_light_48"),
+  HL_vs_GL_72h = c("Combined", "high_light_72", "growth_light_72"),
+  Recovery_vs_HL_14h = c("Combined", "Recovery_14", "high_light_72") # recovery came after high light 72hr
+)
+
+# Function to get and annotate results
+get_annotated_results <- function(contrast_info, alpha = 0.05) {
+  # Get results using contrast
+  res <- results(dds, contrast = contrast_info, alpha = alpha)
+  
+  # Add gene type information
+  res_df <- as.data.frame(res)
+  res_df$gene_id <- rownames(res_df)
+  res_df <- merge(res_df, gene_info_filtered, by.x = "gene_id", by.y = "gene_id")
+  
+  # Add significance flags
+  res_df$significant <- ifelse(res_df$padj < alpha & !is.na(res_df$padj), "Yes", "No")
+  res_df$regulation <- ifelse(res_df$padj < alpha & !is.na(res_df$padj),
+                             ifelse(res_df$log2FoldChange > 0, "Up", "Down"),
+                             "NS")
+  
+  return(res_df)
+}
+
+# Get all results
+all_results <- lapply(names(contrasts_list), function(name) {
+  res <- get_annotated_results(contrasts_list[[name]])
+  res$comparison <- name
+  return(res)
+})
+
+names(all_results) <- names(contrasts_list)
+
+# Look at the summary of DE genes for each comparison
+de_summary <- lapply(all_results, function(res) {
+  data.frame(
+    Total_DE = sum(res$significant == "Yes", na.rm = TRUE),
+    Upregulated = sum(res$regulation == "Up", na.rm = TRUE),
+    Downregulated = sum(res$regulation == "Down", na.rm = TRUE),
+    lncRNA_DE = sum(res$significant == "Yes" & res$gene_type == "lncRNA", na.rm = TRUE),
+    PC_DE = sum(res$significant == "Yes" & res$gene_type == "protein_coding", na.rm = TRUE)
+  )
+})
+
+de_summary_df <- do.call(rbind, de_summary)
+de_summary_df$comparison <- names(all_results)
+
+# Display the summary
+knitr::kable(de_summary_df, caption = "Summary of differentially expressed genes")
+```
+
+**This code chunk actually performs the differential expression and generates the experimental comparisons of interest.**
+
+**The resulting output is a summary table of experimental comparisons.**
+
+> **Group discussion:**
+>
+> Review the differential expression summary table:
+>
+> 1.  What time point change shows the greatest change in transcriptional changes (\# of differentially expressed genes?) Does this make sense from a biological perspective?
+>
+>     1.  Does this track for lncRNAs as well?
+>
+> 2.  What are the relative proportions of upregulated versus downregulated genes for each comparison? Are there any notable patterns?
+
+## Visualizing Differential Expression Results
+
+### MA Plots
+
+MA plots show the relationship between mean expression level (x-axis) and fold change (y-axis), helping to identify expression patterns and potential biases.
+
+```{r ma-plots}
+for(i in seq_along(all_results)) {
+  res_name <- names(all_results)[i]
+  res_df <- all_results[[i]]
+  
+  ma_plot <- ggplot(res_df, aes(x = log10(baseMean), y = log2FoldChange, color = regulation)) +
+    geom_point(alpha = 0.7, size = 1) +
+    scale_color_manual(values = c("Up" = "red", "Down" = "blue", "NS" = "gray80")) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(title = paste("MA Plot -", res_name),
+         x = "log10(Mean Expression)",
+         y = "log2(Fold Change)") +
+    theme_bw()
+  
+  print(ma_plot)
+}
+```
+
+**This code chunk generates a MA plot for each experimental comparison**
+
+**It computes:**
+
+1.  The average \# of counts per gene (expression)
+2.  The change in expression for each gene because of the treatment (log 2 fold change)
+
+> **Group discussion:**
+>
+> Analyze a few of the MA plots.
+>
+> 1.  First, what does a log2 Fold Change value represent in the context of stress?
+> 2.  Generally, what do these plots attempt to tell us? What are the x- and y-axis? How are the colored?
+> 3.  Examine genes/points that have abnormally high log2 Fold-change values, do they tend to have high or low mean expression? Does that make sense?
+> 4.  What patterns do you observe in the distribution of differentially expressed genes? Are highly expressed genes more likely to be identified as differentially expressed?
+
+### Volcano Plots
+
+Volcano plots provide another way to visualize differential expression, highlighting genes with both statistical significance and large fold changes.
+
+```{r volcano-plots}
+# Function to create volcano plots
+create_volcano <- function(res_df, title) {
+  EnhancedVolcano(res_df,
+                  lab = res_df$gene_id,
+                  x = 'log2FoldChange',
+                  y = 'padj',
+                  title = title,
+                  pCutoff = 0.05,
+                  FCcutoff = 1,
+                  pointSize = 2.0,
+                  labSize = 3.0,
+                  col = c('gray', 'gray', 'gray', 'red3'),
+                  colAlpha = 0.8,
+                  legendPosition = 'right',
+                  legendLabSize = 10,
+                  legendIconSize = 3.0)
+}
+
+# Create volcano plots for each comparison
+for(i in seq_along(all_results)) {
+  res_name <- names(all_results)[i]
+  res_df <- all_results[[i]]
+  
+  print(create_volcano(res_df, paste("Volcano Plot -", res_name)))
+}
+```
+
+**This code chunk generates volcano plots for every experimental comparison.**
+
+> **Group discussion:**
+>
+> Examine these volcano plots:
+>
+> 1.  How do you interpret a volcano plot? What are the x- and y-axes representing?
+>
+>     1.  Why is the y-axis -log10 transformed? How would you explain a -log10 P value to a non-scientist?
+>
+> 2.  Why are we interested in both log2 fold change and p-value? Which is more biologically interesting to you?
+>
+> 3.  Go to <https://www.arabidopsis.org/> and search a few of the differentially expressed genes, do they make sense?
+
+## What types of genes are being differentially expressed?
+
+### GO Enrichment Analysis for Up- and Down-regulated Genes
+
+In this section, we'll perform Gene Ontology (GO) enrichment analysis on the differentially expressed protein-coding genes, analyzing upregulated and downregulated genes separately. This will help us understand the biological processes, molecular functions, and cellular components affected by high light treatment.
+
+```{r go-enrichment-degs}
+# Function to perform GO enrichment for a set of genes
+perform_go_enrichment <- function(gene_set, ont = "BP", organism = "org.At.tair.db", 
+                                 title = "GO Enrichment", 
+                                 create_network = FALSE) {
+  # Extract TAIR IDs from gene names (removing "gene:" prefix)
+  gene_set <- gsub("gene:", "", gene_set)
+  
+  # Run enrichment analysis
+  set.seed(42) # For reproducibility
+  ego <- enrichGO(gene = gene_set,
+                 OrgDb = organism,
+                 keyType = "TAIR",
+                 ont = ont,
+                 pAdjustMethod = "BH",
+                 pvalueCutoff = 0.05,
+                 qvalueCutoff = 0.05)
+  
+  # Get results table
+  ego_result <- as.data.frame(ego)
+  
+  # Print summary
+  if (nrow(ego_result) > 0) {
+    message(paste0("Found ", nrow(ego_result), " enriched GO terms (", ont, ")"))
+  } else {
+    message(paste0("No enriched GO terms found (", ont, ")"))
+  }
+  
+  # Plot results if there are any enrichments AND this is a Biological Process analysis
+  if (nrow(ego_result) > 0 && ont == "BP") {
+    # Create dotplot with fold enrichment on x-axis
+    tryCatch({
+      # Get the number of terms to show (at most 20)
+      showCategoryN <- min(20, nrow(ego_result))
+      
+      # Create dotplot with custom ordering using fold enrichment
+      p_dot <- dotplot(ego, 
+                     x = "GeneRatio",  # Default - we'll try fold_enrichment in the catch block
+                     showCategory = showCategoryN,
+                     title = paste0(title, " (", ont, ")")) +
+             theme(axis.text.y = element_text(size = 9))
+      
+      print(p_dot)
+    }, error = function(e) {
+      message("Error creating dotplot: ", e$message)
+      
+      # Try with fold enrichment
+      tryCatch({
+        p_fold <- dotplot(ego, 
+                      x = "fold_enrichment",
+                      showCategory = min(15, nrow(ego_result)), 
+                      title = paste0(title, " (", ont, ")")) +
+                labs(x = "Fold Enrichment")
+        print(p_fold)
+      }, error = function(e2) {
+        # Fallback to default dotplot if both fail
+        tryCatch({
+          p_default <- dotplot(ego, showCategory = min(15, nrow(ego_result)), 
+                            title = paste0(title, " (", ont, ")"))
+          print(p_default)
+          message("Using default dotplot due to errors with custom plots")
+        }, error = function(e3) {
+          message("Error creating any dotplot: ", e3$message)
+        })
+      })
+    })
+  }
+  
+  return(ego)
+}
+
+# Create lists to store enrichment results
+up_go_results <- list()
+down_go_results <- list()
+
+# Loop through each comparison
+for (i in seq_along(all_results)) {
+  res_name <- names(all_results)[i]
+  res_df <- all_results[[i]]
+  
+  # Filter for protein-coding genes only
+  pc_res <- res_df %>% filter(gene_type == "protein_coding")
+  
+  # Extract upregulated and downregulated genes
+  up_genes <- pc_res %>% 
+    filter(padj < 0.05 & log2FoldChange > 0) %>% 
+    pull(gene_id)
+  
+  down_genes <- pc_res %>% 
+    filter(padj < 0.05 & log2FoldChange < 0) %>% 
+    pull(gene_id)
+  
+  # Print summary
+  message(paste0("Comparison: ", res_name))
+  message(paste0("  Upregulated protein-coding genes: ", length(up_genes)))
+  message(paste0("  Downregulated protein-coding genes: ", length(down_genes)))
+  
+  # Only proceed with GO enrichment if we have a sufficient number of genes
+  min_genes_for_analysis <- 10
+  
+  # Analyze upregulated genes - Biological Process only
+  if (length(up_genes) >= min_genes_for_analysis) {
+    message(paste0("\nPerforming GO enrichment for upregulated genes in ", res_name))
+    
+    # Biological Process
+    up_go_results[[paste0(res_name, "_UP_BP")]] <- perform_go_enrichment(
+      up_genes, 
+      ont = "BP", 
+      title = paste0("Upregulated in ", res_name),
+      create_network = FALSE
+    )
+  }
+  
+  # Analyze downregulated genes - Biological Process only
+  if (length(down_genes) >= min_genes_for_analysis) {
+    message(paste0("\nPerforming GO enrichment for downregulated genes in ", res_name))
+    
+    # Biological Process
+    down_go_results[[paste0(res_name, "_DOWN_BP")]] <- perform_go_enrichment(
+      down_genes, 
+      ont = "BP", 
+      title = paste0("Downregulated in ", res_name),
+      create_network = FALSE
+    )
+  }
+}
+```
+
+**This code chunk generates the enriched GO terms for each experimental comparison. Specifically enriched biological process terms for every protein coding gene that is differentially expressed.**
+
+> **Group discussion:**
+>
+> Examine these GO term plots
+>
+> 1.  Why are there 2 plots for each experimental comparison?
+> 2.  What types of biological processes are up-regulated and down-regulated during high light stress?
+> 3.  Do these enriched terms make sense from a biological perspective?
+
+# Long Non-coding RNA Specific Analysis
+
+In this section, we'll focus specifically on lncRNAs and their expression patterns in response to stress.
+
+## Expression Patterns of lncRNAs vs PCGs
+
+```{r lncrna-patterns}
+# Calculate average expression of lncRNAs vs PCGs
+vsd_data <- assay(vsd)
+
+# Extract expression data by gene type
+lncrna_expression <- vsd_data[rownames(vsd_data) %in% 
+                              gene_info_filtered$gene_id[gene_info_filtered$gene_type == "lncRNA"], ]
+pc_expression <- vsd_data[rownames(vsd_data) %in% 
+                         gene_info_filtered$gene_id[gene_info_filtered$gene_type == "protein_coding"], ]
+
+# Function to calculate mean expression by condition and time
+calc_mean_exp <- function(exp_matrix, metadata) {
+  mean_vals <- NULL
+  for(cond in unique(metadata$Treatment)) {
+    for(time in unique(metadata$Time)) {
+      idx <- metadata$Treatment == cond & metadata$Time == time
+      if(sum(idx) > 0) {
+        mean_exp <- rowMeans(exp_matrix[, idx, drop = FALSE])
+        mean_df <- data.frame(
+          gene_id = names(mean_exp),
+          mean_exp = mean_exp,
+          Condition = cond,
+          Time = time
+        )
+        mean_vals <- rbind(mean_vals, mean_df)
+      }
+    }
+  }
+  return(mean_vals)
+}
+
+# Calculate mean expression
+if(nrow(lncrna_expression) > 0) {
+  lncrna_means <- calc_mean_exp(lncrna_expression, metadata)
+  lncrna_means$gene_type <- "lncRNA"
+}
+
+pc_means <- calc_mean_exp(pc_expression, metadata)
+pc_means$gene_type <- "protein_coding"
+
+# Combine the data
+if(exists("lncrna_means") && nrow(lncrna_means) > 0) {
+  all_means <- rbind(lncrna_means, pc_means)
+} else {
+  all_means <- pc_means
+  message("No lncRNAs were found in the filtered dataset")
+}
+
+# Plot expression distributions
+ggplot(all_means, aes(x = mean_exp, fill = gene_type)) +
+  geom_density(alpha = 0.5) +
+  facet_grid(Condition ~ Time) +
+  labs(title = "Expression Distribution by Gene Type",
+       x = "VST Expression",
+       y = "Density") +
+  scale_fill_manual(values = c("lncRNA" = "purple", "protein_coding" = "darkblue")) +
+  theme_bw()
+
+# Boxplot of expression
+ggplot(all_means, aes(x = paste(Condition, Time), y = mean_exp, fill = gene_type)) +
+  geom_boxplot(outlier.size = 0.5) +
+  labs(title = "Expression Levels by Gene Type",
+       x = "Condition and Time",
+       y = "VST Expression") +
+  scale_fill_manual(values = c("lncRNA" = "purple", "protein_coding" = "darkblue")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**This code chunk generates the distribution of gene expression values across each experimental comparison.**
+
+> **Group discussion:**
+>
+> 1.  How do you interpret these plots? What do the axes mean?
+> 2.  How do expression levels of lncRNAs compare to protein-coding genes overall? What biological factors might explain these differences?
+> 3.  Can you observe changes in expression patterns in these gene types across experiments/time points? Why or why not?
+
+## Time-Course Patterns of lncRNAs
+
+```{r lncrna-time-patterns}
+# Function to plot time-course patterns
+plot_time_course <- function(means_df, gene_type_filter, title) {
+  filtered_means <- means_df[means_df$gene_type == gene_type_filter, ]
+  
+  # Group by gene and calculate z-scores
+  gene_z_scores <- filtered_means %>%
+    group_by(gene_id) %>%
+    mutate(z_score = scale(mean_exp)[,1]) %>%
+    ungroup()
+  
+  # Calculate average patterns by condition
+  avg_patterns <- gene_z_scores %>%
+    group_by(Condition, Time) %>%
+    summarize(mean_z = mean(z_score, na.rm = TRUE),
+              se_z = sd(z_score, na.rm = TRUE) / sqrt(n()), .groups = "drop")
+  
+  # Plot average time-course patterns
+  ggplot(avg_patterns, aes(x = as.numeric(Time), y = mean_z, color = Condition, group = Condition)) +
+    geom_line(size = 1) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = mean_z - se_z, ymax = mean_z + se_z), width = 0.2) +
+    labs(title = title,
+         x = "Time (hours)",
+         y = "Average z-score") +
+    scale_color_brewer(palette = "Set1") +
+    theme_bw()
+}
+
+# Plot time-course patterns for lncRNAs and PCGs
+if(exists("lncrna_means") && nrow(lncrna_means) > 0) {
+  print(plot_time_course(all_means, "lncRNA", "Average Time-Course Patterns of lncRNAs"))
+}
+print(plot_time_course(all_means, "protein_coding", "Average Time-Course Patterns of Protein-Coding Genes"))
+```
+
+**This code chunk plots how gene expression (specifically, z-score) changes across time points.**
+
+> **Group discussion:**
+>
+> Compare the time-course patterns for lncRNAs and protein-coding genes:
+>
+> 1.  How do you interpret these plots? What do the axes mean?
+>
+>     1.  What is a z-score?
+>
+> 2.  What are the key differences in how lncRNAs and protein-coding genes respond to stress treatments over time?
+>
+> 3.  Do lncRNAs show earlier or later responses compared to protein-coding genes? What might this suggest about their functional roles?
+>
+> 4.  Based on these time-course patterns, propose a model for how lncRNAs might be involved in the plant stress response network. Are they more likely to be early regulators or late effectors?
+
+## Regulation of lncRNAs in response to high light
+
+```{r lncrna-regulation}
+# Identify stress-responsive lncRNAs
+stress_responsive_lncrnas <- lapply(all_results, function(res) {
+  res %>%
+    filter(gene_type == "lncRNA" & significant == "Yes") %>%
+    dplyr::select(gene_id, log2FoldChange, padj, regulation)
+})
+
+# Check if we have any stress-responsive lncRNAs
+have_DE_lncrnas <- sapply(stress_responsive_lncrnas, nrow) > 0
+
+if(any(have_DE_lncrnas)) {
+  # Get all unique stress-responsive lncRNAs
+  all_sr_lncrnas <- unique(unlist(lapply(stress_responsive_lncrnas[have_DE_lncrnas], function(df) df$gene_id)))
+  
+  if(length(all_sr_lncrnas) > 0) {
+    # Extract expression data for these lncRNAs
+    sr_lncrna_expr <- vsd_data[all_sr_lncrnas, ]
+    
+    # Create a heatmap
+    mat_scaled <- t(scale(t(sr_lncrna_expr)))
+    
+    # Create annotation data frame
+    annotation_col <- data.frame(
+      Condition = metadata$Treatment,
+      Time = metadata$Time,
+      row.names = colnames(sr_lncrna_expr)
+    )
+    
+    # Define colors for annotations
+    ann_colors <- list(
+      Condition = c(growth_light = "lightblue", Recovery = "darkblue", high_light = "darkred"),
+     Time = c("0.5" = "lightgreen", "6" = "green3", "12" = "darkgreen",
+                    "14" = "darkolivegreen", "24" = "darkkhaki", "48" = "darkolivegreen1", "72" = "darkolivegreen4"))
+    
+    # Create heatmap
+    pheatmap(mat_scaled,
+             color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+             annotation_col = annotation_col,
+             annotation_colors = ann_colors,
+             main = "Stress-Responsive lncRNAs",
+             fontsize_row = 8,
+             show_rownames = TRUE,
+             cluster_rows = TRUE,
+             cluster_cols = TRUE)
+  }
+}
+```
+
+**This code chunk generates a heatmap of differentially expressed lncRNAs.**
+
+> **Group discussion:**
+>
+> 1.  How do you interpret this plot? How do differentially expressed lncRNAs cluster?
+>
+> 2.  Where do you observe the greatest "burst" of lncRNA up-regulation?
+
+## Overlap of Differentially Expressed lncRNAs
+
+```{r lncrna-overlap}
+# Create lists of DE lncRNAs for each comparison
+de_lncrna_lists <- lapply(all_results, function(res) {
+  res %>%
+    filter(gene_type == "lncRNA" & significant == "Yes") %>%
+    pull(gene_id)
+})
+
+# Only proceed if we have DE lncRNAs
+if(any(sapply(de_lncrna_lists, length) > 0)) {
+  # Convert to list format required by UpSetR
+  de_lncrna_lists <- de_lncrna_lists[sapply(de_lncrna_lists, length) > 0]
+  
+  if(length(de_lncrna_lists) > 1) {
+    # Create upset plot
+    upset(fromList(de_lncrna_lists), nsets = length(de_lncrna_lists),
+          sets = names(de_lncrna_lists),
+          keep.order = TRUE,
+          sets.bar.color = "darkblue",
+          main.bar.color = "darkblue",
+          text.scale = 1.2,
+          sets.x.label = "Differentially Expressed lncRNAs",
+          mainbar.y.label = "Intersection Size")
+  }
+}
+```
+
+**This code chunk assesses whether lncRNAs are "commonly" differentially expressed, or exclusive to certain experiments.**
+
+> **Group discussion:**
+>
+> 1.  How do you interpret this plot? What is an upset plot attempting to show?
+>
+> 2.  Are lncRNAs typically differentially expressed across several shared experiments, or at specific time points?
+
+# Co-expression Analysis for lncRNA Functional Prediction
+
+Co-expression analysis can help predict potential functions of lncRNAs by identifying protein-coding genes with similar expression patterns.
+
+```{r coexpression-analysis}
+# Calculate correlation between lncRNAs and PCGs
+# This can help predict potential functions of lncRNAs
+lncrna_ids <- gene_info_filtered$gene_id[gene_info_filtered$gene_type == "lncRNA"]
+pc_ids <- gene_info_filtered$gene_id[gene_info_filtered$gene_type == "protein_coding"]
+
+# Only proceed if we have lncRNAs
+if(length(lncrna_ids) > 0 && length(lncrna_ids) < 1000) {  # Limit for computational feasibility
+  # Extract expression values
+  lncrna_exp <- vsd_data[lncrna_ids, ]
+  pc_exp <- vsd_data[pc_ids, ]
+  
+  # Calculate correlations (this might be computationally intensive for large datasets)
+  cor_matrix <- cor(t(lncrna_exp), t(pc_exp), method = "spearman")
+  
+  # For each lncRNA, identify the top correlated PCGs
+  top_correlations <- list()
+  for(i in 1:nrow(cor_matrix)) {
+    lnc_id <- rownames(cor_matrix)[i]
+    cors <- cor_matrix[i, ]
+    top_pos <- names(sort(cors, decreasing = TRUE)[1:10])
+    top_neg <- names(sort(cors, decreasing = FALSE)[1:10])
+    
+    top_correlations[[lnc_id]] <- data.frame(
+      lncRNA = lnc_id,
+      PCG = c(top_pos, top_neg),
+      correlation = c(cors[top_pos], cors[top_neg]),
+      direction = c(rep("positive", 10), rep("negative", 10))
+    )
+  }
+  
+  # Combine all results
+  all_top_cors <- do.call(rbind, top_correlations)
+  
+  # Plot correlations for a few example lncRNAs
+  example_lncs <- sample(unique(all_top_cors$lncRNA), min(5, length(unique(all_top_cors$lncRNA))))
+  
+  for(lnc in example_lncs) {
+    # Get data for this lncRNA
+    lnc_data <- all_top_cors[all_top_cors$lncRNA == lnc, ]
+    
+    # Plot correlations
+    ggplot(lnc_data, aes(x = reorder(PCG, correlation), y = correlation, fill = direction)) +
+      geom_bar(stat = "identity") +
+      coord_flip() +
+      scale_fill_manual(values = c("positive" = "darkred", "negative" = "darkblue")) +
+      theme_bw() +
+      labs(title = paste("Top Correlated PCGs with", lnc),
+           x = "Protein-Coding Gene",
+           y = "Correlation") +
+      theme(legend.position = "top")
+  }
+}
+
+
+ggplot(lnc_data, aes(x = reorder(PCG, correlation), y = correlation, fill = direction)) +
+     geom_bar(stat = "identity") +
+     coord_flip() +
+     scale_fill_manual(values = c("positive" = "darkred", "negative" = "darkblue")) +
+     theme_bw() +
+     labs(title = paste("Top Correlated PCGs with", lnc),
+          x = "Protein-Coding Gene",
+          y = "Correlation") +
+     theme(legend.position = "top")
+```
+
+**This code chunk perform correlation of differentially expressed genes with each lncRNAs. It then plots the top positive and negative correlations and the associated gene ID. This plot is a differentially expressed lncRNA chosen at random.**
+
+> **Group discussion:**
+>
+> 1.  For this example lncRNA, what are the bars representing? What type of analysis was performed?
+>
+> 2.  Go to arabidopsis.org and search a few of these gene IDs. Do they make sense in regards to stress response?
+>
+> 3.  Based on the co-expressed protein-coding genes, can you infer potential functions for this lncRNAs? What biological processes might they be involved in?
+>
+> 4.  What are the limitations of using co-expression analysis to predict lncRNA function? What additional analyses or experiments would strengthen these predictions?
+>
+> 5.  Does positive or negative correlation provide stronger evidence for functional relationships? Explain your reasoning.
+
+# Biological Interpretation
+
+## Enrichment Analysis of Co-expressed Genes
+
+Gene Ontology (GO) enrichment analysis can provide insights into the biological processes associated with lncRNAs through their co-expressed genes.
+
+```{r functional-enrichment}
+# PERFORMANCE NOTE: This section can be computationally intensive.
+# Parameters to adjust for faster execution:
+# - max_lncrnas: Maximum number of lncRNAs to analyze (set lower for faster runtime)
+# - corr_threshold: Minimum correlation to consider 
+# - run_emap: Whether to generate network plots (FALSE = faster)
+# - prioritize_de: Whether to prioritize differentially expressed lncRNAs
+
+max_lncrnas <- 10  # Analyze at most this many lncRNAs
+corr_threshold <- 0.7  # Higher correlation threshold to select fewer genes
+run_emap <- FALSE  # Skip network plots to speed up execution
+prioritize_de <- TRUE  # Focus on DE lncRNAs if available
+
+# If we have lncRNAs, perform enrichment analysis on co-expressed PCGs
+if(exists("all_top_cors")) {
+  # Get TAIR IDs from gene names
+  extract_tair_id <- function(gene_id) {
+    # Extract TAIR ID (e.g., AT1G01010) from gene:AT1G01010
+    gsub("gene:", "", gene_id)
+  }
+  
+  # Function to perform GO enrichment for a set of genes
+  perform_go_enrichment <- function(gene_set, ont = "BP", organism = "org.At.tair.db") {
+    # Convert gene IDs to TAIR format
+    gene_set <- sapply(gene_set, extract_tair_id)
+    
+    tryCatch({
+      # Run enrichment analysis
+      ego <- enrichGO(gene = gene_set,
+                     OrgDb = organism,
+                     keyType = "TAIR",
+                     ont = ont,
+                     pAdjustMethod = "BH",
+                     pvalueCutoff = 0.05,
+                     qvalueCutoff = 0.05)
+      
+      # Return results
+      return(ego)
+    }, error = function(e) {
+      message("Error in GO enrichment: ", e$message)
+      return(NULL)
+    })
+  }
+  
+  # Prioritize lncRNAs for analysis
+  all_lncrnas <- unique(all_top_cors$lncRNA)
+  lncrnas_to_analyze <- all_lncrnas
+  
+  # If we have DE lncRNAs and want to prioritize them
+  if(prioritize_de && exists("de_lncrna_lists") && length(unlist(de_lncrna_lists)) > 0) {
+    de_lncs <- unique(unlist(de_lncrna_lists))
+    # Prioritize DE lncRNAs that are in our correlation data
+    priority_lncs <- intersect(de_lncs, all_lncrnas)
+    if(length(priority_lncs) > 0) {
+      lncrnas_to_analyze <- priority_lncs
+    }
+  }
+  
+  # Limit to max_lncrnas
+  if(length(lncrnas_to_analyze) > max_lncrnas) {
+    lncrnas_to_analyze <- sample(lncrnas_to_analyze, max_lncrnas)
+  }
+  
+  message("Analyzing ", length(lncrnas_to_analyze), " lncRNAs out of ", length(all_lncrnas), " total")
+  
+  # For each selected lncRNA, analyze its positively co-expressed PCGs
+  lncrna_enrichment <- list()
+  
+  for(lnc in lncrnas_to_analyze) {
+    # Get positively correlated PCGs with stricter threshold
+    pos_corr_pcgs <- all_top_cors %>%
+      filter(lncRNA == lnc, direction == "positive", correlation > corr_threshold) %>%
+      pull(PCG)
+    
+    if(length(pos_corr_pcgs) >= 5) {  # Need a minimum number of genes for enrichment
+      message("Analyzing ", lnc, " with ", length(pos_corr_pcgs), " correlated genes")
+      
+      # Perform GO enrichment
+      ego_results <- perform_go_enrichment(pos_corr_pcgs)
+      
+      if(!is.null(ego_results) && nrow(as.data.frame(ego_results)) > 0) {
+        lncrna_enrichment[[lnc]] <- ego_results
+      }
+    }
+  }
+  
+  # Plot results for lncRNAs with significant enrichments
+  for(lnc in names(lncrna_enrichment)) {
+    ego <- lncrna_enrichment[[lnc]]
+    
+    # Simplified dot plot
+    print(dotplot(ego, showCategory = min(10, nrow(as.data.frame(ego))), 
+                  title = paste("GO Enrichment for genes co-expressed with", lnc)))
+    
+    # Network plot (optional)
+    if(run_emap && nrow(as.data.frame(ego)) > 5) {
+      print(emapplot(ego, showCategory = min(10, nrow(as.data.frame(ego))), 
+                     title = paste("Network of GO terms for", lnc)))
+    }
+  }
+}
+```
+
+**This code chunk performs GO term enrichment of the genes co-expressed with different DE lncRNAs.**
+
+> **Group discussion:**
+>
+> If GO enrichment analysis was performed:
+>
+> 1.  For each lncRNA with enrichment results, what biological processes are enriched among its co-expressed genes? Are these processes related to stress responses?
+>
+> 2.  Are there common biological themes across multiple lncRNAs, or does each have a unique functional profile?
+>
+> 3.  Based on these enrichment results, hypothesize potential molecular mechanisms through which these lncRNAs might function in stress responses.
+>
+> 4.  Suppose you had to select just one lncRNA for detailed functional characterization in the lab. Which would you choose based on the enrichment results, and why?
+
+## Stress-Responsive lncRNA Analysis
+
+Let's take a closer look at lncRNAs that respond are responsive to several of the stress time points, which might be key regulators of general stress responses.
+
+```{r stress-lncrna-analysis}
+# For lncRNAs that respond to both high light and recovery, examine their patterns more closely
+if(exists("de_lncrna_lists") && length(de_lncrna_lists) >= 2) {
+  
+  # Find lncRNAs that respond to both high light and recovery
+  high_light_responsive <- unique(unlist(de_lncrna_lists[grep("HL_vs", names(de_lncrna_lists))]))
+  recovery_responsive <- unique(unlist(de_lncrna_lists[grep("Recovery_vs", names(de_lncrna_lists))]))
+  
+  common_responsive <- intersect(high_light_responsive, recovery_responsive)
+  
+  if(length(common_responsive) > 0) {
+    # Extract expression data for these lncRNAs
+    common_expr <- vsd_data[common_responsive, ]
+    
+    # Plot expression patterns
+    melted_data <- reshape2::melt(common_expr)
+    colnames(melted_data) <- c("lncRNA", "Sample", "Expression")
+    
+    # Add metadata
+    melted_data$Treatment <- metadata$Treatment[match(melted_data$Sample, rownames(metadata))]
+    melted_data$Time <- metadata$Time[match(melted_data$Sample, rownames(metadata))]
+    
+    # Plot time-course for each common responsive lncRNA
+    for(lnc in common_responsive) {
+      lnc_data <- melted_data[melted_data$lncRNA == lnc, ]
+      
+      p <- ggplot(lnc_data, aes(x = Time, y = Expression, color = Treatment, group = Treatment)) +
+        geom_point(size = 3) +
+        geom_line(size = 1) +
+        scale_color_brewer(palette = "Set1") +
+        theme_bw() +
+        labs(title = paste("Expression Pattern of", lnc),
+             x = "Time (hours)",
+             y = "VST Expression")
+      
+    #  print(p)
+    }
+    
+    # Create a clustered heatmap of these lncRNAs
+    mat_scaled <- t(scale(t(common_expr)))
+    
+    # Create annotation data frame
+    annotation_col <- data.frame(
+      Condition = metadata$Treatment,
+      Time = metadata$Time,
+      row.names = colnames(common_expr)
+    )
+    
+    # Define colors for annotations
+    ann_colors <- list(
+                 Condition = c(growth_light = "lightblue", Recovery = "darkblue", high_light = "darkred"),
+           Time = c("0.5" = "lightgreen", "6" = "green3", "12" = "darkgreen",
+                    "14" = "darkolivegreen", "24" = "darkkhaki", "48" = "darkolivegreen1", "72" = "darkolivegreen4"))
+    
+    # Create heatmap
+    pheatmap(mat_scaled,
+             color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+             annotation_col = annotation_col,
+             annotation_colors = ann_colors,
+             main = "Common Stress-Responsive lncRNAs",
+             fontsize_row = 8,
+             show_rownames = TRUE,
+             cluster_rows = TRUE,
+             cluster_cols = TRUE)
+  }
+}
+```
+
+**This code chunk identifies lncRNAs that are DE to both high light AND recovery. It then plots the expression change across time for each lncRNA (don't worry about looking at all of them) - and a summary heatmap.**
+
+> **Group discussion:**
+>
+> All these plots are lncRNAs that are significantly responsive to high light and recovery.
+>
+> 1.  Can you point out clusters of genes that seem to be most strongly up/down regulated during the different experimental comparisons?
+> 2.  What might these groupings tell us about their functions?
+> 3.  Are these common responsive lncRNAs more likely to be involved in general stress signaling or specific response pathways? Explain your reasoning.
+> 4.  Design a hypothetical follow-up experiment to validate the function of one of these common stress-responsive lncRNAs. What approach would you take and what results would you expect?
+
+# Network Analysis of Transcription Factors and lncRNAs
+
+This section explores the potential regulatory networks involving transcription factors (TFs) and lncRNAs, identifying key regulatory hubs and modules that may be important in stress responses.
+
+```{r TF-loading}
+# Import transcription factor list
+tf_link <- "https://raw.githubusercontent.com/kylepalos/Cornell-teaching/refs/heads/main/data/Ath_TF_list.txt"
+
+download.file(tf_link,
+              "~/Downloads/Ath_TF_list.txt")
+
+tf_list <- read.delim("~/Downloads/Ath_TF_list.txt", stringsAsFactors = FALSE)
+head(tf_list)
+
+# Create a mapping between gene IDs and TF families
+# Convert TAIR IDs to match our gene IDs (convert AT1G01010 to gene:AT1G01010)
+tf_mapping <- tf_list %>%
+  dplyr::select(Gene_ID, Family) %>%
+  distinct() %>%
+  mutate(gene_id = paste0("gene:", Gene_ID))
+
+# Show TF families
+tf_family_counts <- table(tf_list$Family)
+tf_family_df <- data.frame(
+  Family = names(tf_family_counts),
+  Count = as.numeric(tf_family_counts)
+) %>%
+  arrange(desc(Count))
+
+# Plot TF family distribution
+ggplot(head(tf_family_df, 20), aes(x = reorder(Family, Count), y = Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 20 Transcription Factor Families",
+       x = "TF Family",
+       y = "Count") +
+  theme_bw()
+```
+
+**We are about to generate a regulatory network. This code chunk loads in a database of Arabidopsis TFs and plots how many of each family are present in the database.**
+
+> **Group discussion:**
+>
+> 1.  Thinking about lncRNA and stress biology, why would we also be interested in assessing transcription factor activity?
+>
+> 2.  Looking at the TF family distribution plot, which families are most abundant in Arabidopsis? Do any of these TF families have known roles in stress responses?
+>
+> 3.  Why might studying interactions between TFs and lncRNAs be particularly informative for understanding stress response regulation?
+
+## Building the regulatory network:
+
+```{r network-building}
+# Load network analysis packages
+library(igraph)
+library(ggraph)
+library(tidygraph)
+
+# Function to build correlation-based network
+build_correlation_network <- function(expr_matrix, gene_info, 
+                                      tf_mapping, 
+                                      min_correlation = 0.7) {
+  # Calculate correlation matrix
+  cor_matrix <- cor(t(expr_matrix), method = "spearman")
+  
+  # Create an empty edge list
+  edge_list <- data.frame(
+    from = character(),
+    to = character(),
+    weight = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Identify TFs in our dataset
+  tf_genes <- intersect(rownames(expr_matrix), tf_mapping$gene_id)
+  
+  # Identify lncRNAs in our dataset
+  lncrna_genes <- rownames(expr_matrix)[gene_info$gene_type[match(rownames(expr_matrix), gene_info$gene_id)] == "lncRNA"]
+  
+  # Identify protein-coding genes that are not TFs
+  pc_genes <- setdiff(
+    rownames(expr_matrix)[gene_info$gene_type[match(rownames(expr_matrix), gene_info$gene_id)] == "protein_coding"],
+    tf_genes
+  )
+  
+  # Display counts
+  message("Network will include:")
+  message("- ", length(tf_genes), " transcription factors")
+  message("- ", length(lncrna_genes), " lncRNAs")
+  message("- ", length(pc_genes), " other protein-coding genes")
+  
+  # For computational efficiency, limit the number of regular PCGs
+  if(length(pc_genes) > 500) {
+    message("Limiting regular protein-coding genes to 500 for network analysis")
+    pc_genes <- sample(pc_genes, 500)
+  }
+  
+  # Build network focusing on key interactions:
+  # 1. TF-TF interactions
+  if(length(tf_genes) > 0) {
+    for(i in 1:(length(tf_genes)-1)) {
+      for(j in (i+1):length(tf_genes)) {
+        if(abs(cor_matrix[tf_genes[i], tf_genes[j]]) > min_correlation) {
+          edge_list <- rbind(edge_list, data.frame(
+            from = tf_genes[i],
+            to = tf_genes[j],
+            weight = cor_matrix[tf_genes[i], tf_genes[j]],
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+    }
+  }
+  
+  # 2. TF-lncRNA interactions
+  if(length(tf_genes) > 0 && length(lncrna_genes) > 0) {
+    for(tf in tf_genes) {
+      for(lnc in lncrna_genes) {
+        if(abs(cor_matrix[tf, lnc]) > min_correlation) {
+          edge_list <- rbind(edge_list, data.frame(
+            from = tf,
+            to = lnc,
+            weight = cor_matrix[tf, lnc],
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+    }
+  }
+  
+  # 3. lncRNA-PCG interactions
+  if(length(lncrna_genes) > 0 && length(pc_genes) > 0) {
+    for(lnc in lncrna_genes) {
+      for(pc in pc_genes) {
+        if(abs(cor_matrix[lnc, pc]) > min_correlation) {
+          edge_list <- rbind(edge_list, data.frame(
+            from = lnc,
+            to = pc,
+            weight = cor_matrix[lnc, pc],
+            stringsAsFactors = FALSE
+          ))
+        }
+      }
+    }
+  }
+  
+  # Create node attributes
+  nodes <- data.frame(
+    id = unique(c(edge_list$from, edge_list$to)),
+    stringsAsFactors = FALSE
+  )
+  
+  # Add node type
+  nodes$type <- "other"
+  nodes$type[nodes$id %in% tf_genes] <- "TF"
+  nodes$type[nodes$id %in% lncrna_genes] <- "lncRNA"
+  nodes$type[nodes$id %in% pc_genes] <- "PCG"
+  
+  # Add TF family information
+  nodes$family <- NA
+  tf_indices <- which(nodes$type == "TF")
+  if(length(tf_indices) > 0) {
+    for(i in tf_indices) {
+      gene_id <- nodes$id[i]
+      family <- tf_mapping$Family[tf_mapping$gene_id == gene_id]
+      if(length(family) > 0) {
+        nodes$family[i] <- family[1]
+      }
+    }
+  }
+  
+  # Create igraph object
+  g <- graph_from_data_frame(edge_list, directed = FALSE, vertices = nodes)
+  
+  # Remove isolated nodes
+  g <- delete_vertices(g, degree(g) == 0)
+  
+  return(g)
+}
+
+# Build the network
+network <- build_correlation_network(
+  expr_matrix = vsd_data, 
+  gene_info = gene_info_filtered,
+  tf_mapping = tf_mapping,
+  min_correlation = 0.75  # Higher correlation threshold for cleaner network
+)
+
+# Add edge attributes (needed for visualization) in case they're missing
+if(!"weight" %in% edge_attr_names(network)) {
+  edge_weights <- rep(1, ecount(network))
+  E(network)$weight <- edge_weights
+  message("Added default edge weights")
+}
+
+# Network summary
+summary(network)
+table(V(network)$type)
+```
+
+> **The above code performs a type of co-expression analysis of all gene types and attempts to pull out connections that are significantly correlated. The ultimate goal is to identify other genes that lncRNAs may be regulated by or are regulating.**
+
+> **Group discussion:**
+>
+> 1.  What does the table of node types tell you about the composition of the regulatory network? Are TFs, lncRNAs, or other PCGs more abundant in the network?
+>
+> 2.  What are some limitations of using correlation-based networks to infer regulatory relationships? What other types of data could strengthen our network analysis?
+
+## Visualizing the network
+
+### subset the network first:
+
+```{r subset-network}
+# Function to subset networks to a more manageable size maintaining strong connections
+subset_network <- function(network, 
+                           max_nodes = 300, 
+                           min_correlation = 0.8,
+                           prioritize_tfs_lncrnas = TRUE) {
+  
+  message("Original network size: ", vcount(network), " nodes and ", ecount(network), " edges")
+  
+  # Convert to tidygraph if it's not already
+  if (!inherits(network, "tbl_graph")) {
+    network <- as_tbl_graph(network)
+  }
+  
+  # Step 1: filter edges by correlation strength
+  filtered_net <- network %>%
+    activate(edges) %>%
+    filter(abs(weight) >= min_correlation) %>%
+    # Remove isolated nodes
+    activate(nodes) %>%
+    filter(centrality_degree() > 0)
+  
+  message("After correlation filtering: ", vcount(filtered_net), " nodes and ", 
+          ecount(filtered_net), " edges")
+  
+  # If still too large, prioritize important nodes
+  if (vcount(filtered_net) > max_nodes) {
+    
+    # compute node importance
+    filtered_net <- filtered_net %>%
+      activate(nodes) %>%
+      mutate(
+        degree = centrality_degree(),
+        betweenness = centrality_betweenness(normalized = TRUE),
+        # Create importance score prioritizing TFs and lncRNAs if requested
+        importance = if(prioritize_tfs_lncrnas) {
+          case_when(
+            type == "TF" ~ degree * 2,
+            type == "lncRNA" ~ degree * 1.5,
+            TRUE ~ degree
+          )
+        } else {
+          degree
+        }
+      )
+    
+    # keep all TFs and lncRNAs 
+    if (prioritize_tfs_lncrnas) {
+      key_nodes <- filtered_net %>%
+        activate(nodes) %>%
+        as_tibble() %>%
+        filter(type %in% c("TF", "lncRNA"))
+      
+      # How many slots left for other nodes
+      remaining_slots <- max_nodes - nrow(key_nodes)
+      
+      if (remaining_slots > 0) {
+        # Get other nodes by importance
+        other_nodes <- filtered_net %>%
+          activate(nodes) %>%
+          as_tibble() %>%
+          filter(!type %in% c("TF", "lncRNA")) %>%
+          arrange(desc(importance)) %>%
+          head(remaining_slots)
+        
+        # Combine nodes
+        selected_nodes <- bind_rows(key_nodes, other_nodes)
+      } else {
+        # If too many TFs/lncRNAs, take top ones by importance
+        selected_nodes <- key_nodes %>%
+          arrange(desc(importance)) %>%
+          head(max_nodes)
+      }
+    } else {
+      # Simply select top nodes by importance
+      selected_nodes <- filtered_net %>%
+        activate(nodes) %>%
+        as_tibble() %>%
+        arrange(desc(importance)) %>%
+        head(max_nodes)
+    }
+    
+    # filter network to keep only selected nodes
+    filtered_net <- filtered_net %>%
+      activate(nodes) %>%
+      filter(name %in% selected_nodes$name)
+  }
+  
+  # convert back to igraph if needed
+  message("Final network size: ", vcount(filtered_net), " nodes and ", 
+          ecount(filtered_net), " edges")
+  
+  return(filtered_net)
+}
+
+# Subset the original network
+subset_size <- 250  # Adjust this number based on your computer's memory
+subset_correlation <- 0.85  # Adjust to keep stronger correlations
+
+# create a subset of the network for visualization
+network_subset <- subset_network(
+  network = network,
+  max_nodes = subset_size,
+  min_correlation = subset_correlation,
+  prioritize_tfs_lncrnas = TRUE
+)
+
+# convert igraph to tidygraph for easier manipulation
+network_tidy <- network_subset %>%
+  activate(nodes) %>%
+  mutate(
+    degree = centrality_degree(),
+    importance = case_when(
+      type == "TF" ~ degree * 1.5,
+      type == "lncRNA" ~ degree * 1.2,
+      TRUE ~ degree
+    )
+  )
+
+# create color palette for node types
+node_colors <- c(
+  "TF" = "#E41A1C",      # Red for TFs
+  "lncRNA" = "#377EB8",  # Blue for lncRNAs 
+  "PCG" = "#4DAF4A",     # Green for PCGs
+  "other" = "#999999"    # Gray for others
+)
+
+# convert to absolute weights for layout
+network_tidy <- network_tidy %>%
+  activate(edges) %>%
+  mutate(abs_weight = abs(weight))
+```
+
+### Now visualize:
+
+```{r vis-network}
+# Load required packages
+library(dplyr)
+library(ggplot2)
+library(igraph)
+library(tidygraph)
+
+# network visualization function
+plot_improved_network <- function(network_tidy,
+                                 top_tf_hubs = 5,
+                                 top_lncrna_hubs = 3,
+                                 top_edges_per_hub = 15,  # Show only strongest connections per hub
+                                 edge_threshold = 0.9,    # Only show edges with weight > threshold
+                                 label_offset = 0.15,     # How far to position labels from nodes
+                                 show_all_edges = FALSE,  # show all background edges?
+                                 label_cleanup = TRUE)    # clean up gene names in labels?
+{
+  
+  # Extract nodes and edges
+  nodes_df <- network_tidy %>% 
+    activate(nodes) %>% 
+    as_tibble()
+  
+  edges_df <- network_tidy %>% 
+    activate(edges) %>% 
+    as_tibble()
+  
+  # Generate layout using igraph
+  g <- as.igraph(network_tidy)
+  layout_matrix <- igraph::layout_in_circle(g)
+  
+  # Create a node dataframe with positions
+  node_positions <- data.frame(
+    node_id = 1:nrow(layout_matrix),
+    x = layout_matrix[,1],
+    y = layout_matrix[,2]
+  )
+  
+  # Combine with node attributes
+  nodes_with_pos <- nodes_df %>%
+    mutate(node_id = row_number()) %>%
+    left_join(node_positions, by = "node_id")
+  
+  # Identify top hubs
+  top_tfs <- nodes_with_pos %>%
+    filter(type == "TF") %>%
+    arrange(desc(importance)) %>%
+    head(top_tf_hubs)
+  
+  top_lncrnas <- nodes_with_pos %>%
+    filter(type == "lncRNA") %>%
+    arrange(desc(importance)) %>%
+    head(top_lncrna_hubs)
+  
+  # Combine top hubs
+  top_hubs <- bind_rows(top_tfs, top_lncrnas)
+  
+  # Clean up label names if requested
+  if (label_cleanup) {
+    top_hubs <- top_hubs %>%
+      mutate(
+        display_label = gsub("gene:", "", name),  # Remove gene: prefix
+        display_label = gsub("MSTRG\\.([0-9]+).*", "MSTRG.\\1", display_label)  # Simplify MSTRG identifiers
+      )
+  } else {
+    top_hubs$display_label <- top_hubs$name
+  }
+  
+  # Create edge dataframe with positions
+  edges_with_pos <- edges_df %>%
+    mutate(
+      x = nodes_with_pos$x[from],
+      y = nodes_with_pos$y[from],
+      xend = nodes_with_pos$x[to],
+      yend = nodes_with_pos$y[to],
+      from_name = nodes_with_pos$name[from],
+      to_name = nodes_with_pos$name[to],
+      from_type = nodes_with_pos$type[from],
+      to_type = nodes_with_pos$type[to],
+      weight_abs = abs(weight),
+      correlation_type = ifelse(weight > 0, "Positive", "Negative")
+    )
+  
+  # Filter edges connected to top hubs
+  hub_edges <- edges_with_pos %>%
+    filter(from_name %in% top_hubs$name | to_name %in% top_hubs$name) %>%
+    # Keep only edges above threshold
+    filter(weight_abs > edge_threshold) %>%
+    # For each hub, keep only top N strongest connections
+    group_by(from_name) %>%
+    arrange(desc(weight_abs)) %>%
+    slice_head(n = top_edges_per_hub) %>%
+    ungroup() %>%
+    # Do the same for incoming connections
+    bind_rows(
+      edges_with_pos %>%
+        filter(to_name %in% top_hubs$name) %>%
+        filter(weight_abs > edge_threshold) %>%
+        group_by(to_name) %>%
+        arrange(desc(weight_abs)) %>%
+        slice_head(n = top_edges_per_hub) %>%
+        ungroup()
+    ) %>%
+    # Remove duplicates
+    distinct(from, to, .keep_all = TRUE)
+  
+  # Calculate offset positions for labels to prevent overlap with nodes
+  top_hubs <- top_hubs %>%
+    mutate(
+      # Calculate angle from center to node
+      angle = atan2(y, x),
+      # Position label further out from the node
+      label_x = x + cos(angle) * label_offset,
+      label_y = y + sin(angle) * label_offset
+    )
+  
+  # Create the plot
+  p <- ggplot()
+  
+  # Add background edges if requested (very faint)
+  if (show_all_edges) {
+    p <- p + 
+      geom_segment(
+        data = edges_with_pos %>% filter(weight_abs > edge_threshold),
+        aes(x = x, y = y, xend = xend, yend = yend, color = correlation_type),
+        alpha = 0.05,
+        size = 0.1
+      )
+  }
+  
+  # Add hub edges (stronger)
+  p <- p +
+    geom_segment(
+      data = hub_edges,
+      aes(x = x, y = y, xend = xend, yend = yend, color = correlation_type),
+      alpha = 0.6,
+      size = 0.4
+    )
+  
+  # Add directional arrows to hub edges
+  p <- p +
+    geom_segment(
+      data = hub_edges,
+      aes(
+        x = x + (xend - x) * 0.7,  # Position arrow 70% along the edge
+        y = y + (yend - y) * 0.7,
+        xend = xend,
+        yend = yend,
+        color = correlation_type
+      ),
+      arrow = arrow(length = unit(0.2, "cm"), type = "closed"),
+      alpha = 1,
+      size = 0.9
+    )
+  
+  # Add nodes
+  p <- p +
+    # Add background nodes
+    geom_point(
+      data = nodes_with_pos,
+      aes(x = x, y = y, color = type, shape = type),
+      alpha = 0.5,
+      size = 2
+    ) +
+    # Add highlighted hub nodes
+    geom_point(
+      data = top_hubs,
+      aes(x = x, y = y, color = type, shape = type, size = importance),
+      alpha = 0.8
+    ) +
+    # Add node labels with offset
+    geom_text(
+      data = top_hubs,
+      aes(x = label_x, y = label_y, label = display_label, color = type),
+      size = 3,
+      fontface = "bold",
+      hjust = "outward",
+     vjust = "outward",
+      check_overlap = TRUE
+    )
+  
+  # Set colors
+  p <- p +
+    scale_color_manual(
+      values = c(
+        "TF" = "#E41A1C",
+        "lncRNA" = "#377EB8",
+        "PCG" = "#4DAF4A",
+        "other" = "#999999",
+        "Positive" = "#4393C3",
+        "Negative" = "#D6604D"
+      )
+    ) +
+    # Set shapes
+    scale_shape_manual(
+      values = c(
+        "TF" = 17,
+        "lncRNA" = 15,
+        "PCG" = 16,
+        "other" = 19
+      )
+    ) +
+    # Set size scale
+    scale_size_continuous(
+      range = c(3, 6)
+    )
+  
+  # Finalize the plot
+  p <- p +
+    # Set theme
+    theme_void() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(face = "bold", size = 14),
+      plot.subtitle = element_text(size = 10)
+    ) +
+    # Add title
+    labs(
+      title = "Gene Regulatory Network",
+      subtitle = paste0(
+        "Network with ", nrow(nodes_with_pos), 
+        " nodes and ", nrow(edges_with_pos), " edges",
+        "\nHighlighting top ", top_tf_hubs, " TFs and top ", 
+        top_lncrna_hubs, " lncRNAs"
+      )
+    ) +
+    # Ensure plot is square
+   coord_fixed()
+  
+  return(p)
+}
+
+# Use the improved function with your network
+p <- plot_improved_network(
+  network_tidy,
+  top_tf_hubs = 5,
+  top_lncrna_hubs = 3,
+  top_edges_per_hub = 1,     
+  edge_threshold = 0.9,     
+  label_offset = 0.08,      # Increased label offset to push labels further out
+  show_all_edges = FALSE    
+)
+
+# Add additional modifications to prevent label clipping
+p <- p +
+  # Increase plot margins to provide space for labels
+  theme(
+    plot.margin = margin(30, 30, 30, 30),  # Add more margin all around
+    legend.position = "right",
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10)
+  ) +
+  # Ensure plot is square with extra padding for labels
+  coord_fixed(xlim = c(-1.3, 1.3), ylim = c(-1.3, 1.3))  # Expand the view area beyond the circle
+
+p
+
+```
+
+**This code chunk visualizes the regulatory network. Significant connections between genes are shown by lines across the network. Thick endings are the "end" of the line (pointing towards the regulated gene).**
+
+> **Group discussion:**
+>
+> This code chunk generate a network plot of the most "connected" members of the co-expression plot.
+>
+> Examine the network visualization:
+>
+> 1.  Identify the top TF and lncRNA hubs in the network. Why might these nodes be particularly important in the stress response network?
+>
+> 2.  Notice the positive (blue) and negative (red) correlations in the network. What might negative correlations between genes indicate in terms of regulatory relationships?
+>
+> 3.  Based on this network visualization, propose a hypothesis about how lncRNAs might interact with transcription factors or are being regulated by to regulate stress responses in plants.
+
+## Identifying key regulatory hubs:
+
+```{r identify-regulatory-hubs}
+# Find top nodes by centrality measures
+top_nodes <- data.frame(
+  gene_id = V(network_subset)$name,
+  type = V(network_subset)$type,
+  family = V(network_subset)$family,
+ degree = V(network_subset)$degree,
+  betweenness = V(network_subset)$betweenness
+ # closeness = V(network_subset)$closeness,
+#  community = V(network_subset)$community
+) %>%
+  arrange(desc(degree))
+
+# Show top 20 hubs
+top_20_hubs <- head(top_nodes, 20)
+knitr::kable(top_20_hubs, caption = "Top 20 Regulatory Hubs Based on Network Centrality")
+
+# Plot top hubs by type
+ggplot(head(top_nodes, 30), aes(x = reorder(gsub("gene:", "", gene_id), degree), 
+                               y = degree, fill = type)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Top 30 Regulatory Hubs",
+       x = "Gene ID",
+       y = "Degree Centrality") +
+  scale_fill_manual(values = node_colors) +
+  theme_bw()
+
+# Focus on TF and lncRNA hubs
+tf_lnc_hubs <- top_nodes %>%
+  filter(type %in% c("TF", "lncRNA")) %>%
+  arrange(desc(degree)) %>%
+  head(20)
+
+ggplot(tf_lnc_hubs, aes(x = reorder(gsub("gene:", "", gene_id), degree), 
+                       y = degree, fill = type)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Top TF and lncRNA Regulatory Hubs",
+       x = "Gene ID",
+       y = "Degree Centrality") +
+  scale_fill_manual(values = node_colors[c("TF", "lncRNA")]) +
+  theme_bw()
+```
+
+**This code chunk attempts to quantify how "connected" the top regulatory hubs are and ranks them.**
+
+> **Group discussion:**
+>
+> Examine the tables and plots of regulatory hubs:
+>
+> 1.  Which genes emerge as the top regulatory hubs in the network? Look up some of the protein coding genes on arabidopsis.org and determine if they make sense in the context of stress response.
+>
+> 2.  If you were designing a functional study to investigate the role of these regulatory hubs in stress responses, which 2-3 genes would you prioritize for experimental validation, and why?
+
+# Summary and Conclusions
+
+This analysis of RNA-seq data identified differentially expressed genes, including lncRNAs, in response to time-series high light treatments.
+
+> **Class Discussion Activity:**
+>
+> In small groups, discuss and synthesize the key findings from this analysis:
+>
+> 1.  What were the most significant patterns observed in the differential expression analysis? How did the responses to ABA and salt treatments differ, and how were they similar?
+>
+> 2.  What have we learned about the expression and potential regulatory roles of lncRNAs in stress responses? What evidence supports these conclusions?
+>
+> 3.  Based on the network analysis, what models can we propose about the regulatory interactions between lncRNAs, transcription factors, and other genes in stress response networks?
+>
+> 4.  What are the limitations of this analysis, and what additional experiments or analyses would you recommend to strengthen the findings?
+
+**Future investigations could include:**
+
+1.  Functional characterization of common stress-responsive lncRNAs through knockdown or overexpression studies.
+
+2.  Investigation of the genomic locations of stress-responsive lncRNAs relative to their co-expressed protein-coding genes.
+
+3.  Analysis of potential cis-regulatory elements in the promoters of stress-responsive lncRNAs.
+
+4.  Integration with other omics data (e.g., ChIP-seq) to understand the regulatory networks involving these lncRNAs.
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
